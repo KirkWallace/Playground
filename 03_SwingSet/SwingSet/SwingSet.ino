@@ -1,46 +1,54 @@
-// Proximity Sensor Midi Controller, 4ch /////
-// SETTINGS:
-#define channel 5         //  midi channel -1 (starts at 0 = channel 1)
-#define cc1 60           // first midi CC number + Analog: CC 0-7 / Buttons: CC 8-11
-#define min_dist 10      //*** cm distance to Trigger within (122=4' 190~6')
-#define max_dist 190   // maximum distance (in cm) to check
-#define echo 15     // delay time in ms between sensor reads (29 ms to avoid ping overlap)
-//const byte thechannel = 5;
+//SwingSet Production code
+// Directions for use:
+//    1) Flash with board type: Arduino Leonardo
+//    2) Connect back to the server (ethernet USB extender) - verify all connections are secure
+//    3) make sure playground piece to test is the only one plugged in
+//    4) open MIDI viewer, select arduino leonardo, test the playground piece
+//    5) Expected behavior: When you sit on a swing the MIDI viewer will display the MIDI data
+//                          if midi type is CC, then the channel(3), control number (80-83) and value (10 = OFF, 100 = ON) should be displayed
+//                          if midi type is note, then the channel(3) and note, Swing 0 (53 = F), Swing 1 (55 = G), Swing 2 (57 = A), Swing 3 (59 = B) will be displayed
+//    NOTE: switches need to be wired with the COM1 terminal to GND (black) and NO3 terminal to signal wire (yellow or blue)
 
-#include <NewPing.h>
+// MIDI SETTINGS:
+#define channel 3         // Can be anywhere from 0-15 reported to user as 1-16: These need to be unique
+#define ccControl 80      // need to avoid 32 (used for lots of things internally in Ableton 
+                          // control number (0-119). for safety dont overlap with any other playground piece
+#define ccON 100          // CC value above 64 is on signal to ableton
+#define ccOFF 10          // CC value below 63 is off signal to ableton
+
 #include <MIDIUSB.h>
-
-
-const int DEBUG = 2;
-
 const int MIDI_cc = 1; 
 const int MIDI_note = 2; 
 int MIDI_DataType;
 
-// default action is Momentary. to change a sensor to Toggle, change it's 1 to a 0 in it's position below:
-bool m[4] = {1, 1, 1, 1}; // MOMENTARY MODE for each sensor
-// Sensor:   1  2  3  4
+/////----DEBUG SETTINGS:
+//--DEBUG = -1 :: Timing info
+//--DEBUG = 0  :: Production state NEED TO BE 0 FOR FINAL INSTALL
+//--DEBUG >= 1  :: Swing logic, what swing is triggered and the note being sent
+const int DEBUG = 0;
 
-
-//Timing Variables setup
+//CONTROL LOGIC SETTINGS: Timing Variables and data structure
 long cycle = 0; //used to determine how many milliseconds since the last ping cycle
 int cycleLED = 0; //used to keep track of how long the LED has been on and turn it off within a second
-const int NUMSENSORS = 4; 
-const int READSPERCYCLE = 10; //roughly the number of times you can read each sensor within 500ms given an echo of 33ms 
-int sensorLog[NUMSENSORS][READSPERCYCLE];
-int triggeredSensors[NUMSENSORS];
-int tempSum[NUMSENSORS];
-const int hitTriggerON = 6;
-const int hitTriggerOFF = 0;  
+const int NUMSWINGS = 4;  // 4 swings per swing set
+const int NUMSENSORS = 2; // 2 sensors per swing
+const int READSPERCYCLE = 10; //can be used for debouncing the switches if needed
+int sensorLog[NUMSWINGS][NUMSENSORS];  //raw data within each cycle
+int triggeredSwings[NUMSWINGS]; //used to bridge the cycles
+int tempSum[NUMSWINGS]; //sums two sensors into one read out
 const int SEC = 1000; //define 1 second as 1000 ms
+const int minOFFdelay = 1 * SEC; //used to hold the merry go round on if it is used for less than 3 seconds.
+const int cycleRefresh = 200; // 200ms delays to reads
+int lastON[NUMSWINGS]; //time of the last ON signal sent. used to make sure the trigger is on for longer than minOFFdelay
 
-NewPing sonar[4] = {   // Sensor object array.
-  NewPing(10, 16, max_dist), // Each sensor's trigger pin, echo pin, and max distance to ping.
-  NewPing(14, 15, max_dist),
-  NewPing(18, 19, max_dist),
-  NewPing(20, 21, max_dist)
+int swingSetPins[NUMSWINGS][NUMSENSORS] = //pin numbers for each swing. two sensors per swing
+{ {10,16},  //Swing 1
+  {14, 15}, //Swing 2
+  {18, 19}, //Swing 3
+  {20, 21}  //Swing 4
 };
 
+//MIDI methods:
 void controlChange(byte thechannel, byte control, byte value) {
   midiEventPacket_t event = {0x0B, 0xB0 | thechannel, control, value};
   MidiUSB.sendMIDI(event);
@@ -50,156 +58,174 @@ void controlChange(byte thechannel, byte control, byte value) {
 void noteOn(byte thechannel, byte pitch, byte velocity) {
   midiEventPacket_t noteOn = {0x09, 0x90 | thechannel, pitch, velocity};
   MidiUSB.sendMIDI(noteOn);
-  MidiUSB.flush();
 }
 
 void noteOff(byte thechannel, byte pitch, byte velocity) {
   midiEventPacket_t noteOff = {0x08, 0x80 | thechannel, pitch, velocity};
   MidiUSB.sendMIDI(noteOff);
-  MidiUSB.flush();
 }
 
+//ARDUINO SETUP: initialize all variables to their default state and setup serial monitor.
+//              -setup pinout for the board.
+//              -switches need to be wired with the COM1 terminal to GND (black) and NO3 terminal to signal wire (yellow or blue)
 void setup() {
-  
+
   Serial.begin(115200);
-  //while (!Serial) {
-    // some boards need to wait to ensure access to serial over USB
-  //}
+
   cycle = millis();
 
-  //initialize tempSum to avoid floating piont values
-  for(int i=0; i<NUMSENSORS; i++){
+  //set the midi data type
+  MIDI_DataType = MIDI_cc; //options: MIDI_note or MIDI_cc
+  
+  //initialize data structure and pinModes
+  for (int i = 0; i < NUMSWINGS; i++) {
     tempSum[i] = 0;
+    lastON[i] = -1; //lastON < 0 is off.
+
+    for (int k = 0; k < NUMSENSORS; k++) {
+      sensorLog[i][k] = 0;
+      pinMode(swingSetPins[i][k], INPUT_PULLUP);
+    }
   }
 
-  //set the midi data type
-  MIDI_DataType = MIDI_note; //options: MIDI_note or MIDI_cc
   //onboard LED to notify locally of triggers
   pinMode(LED_BUILTIN, OUTPUT);
 
-  //delay(5*SEC); //keep the system from sending triggers for 30 seconds during boot up
 }
 
-
+//CONTROL LOGIC:
 void loop() {
-      int refreshTime = millis() - cycle; 
-      if(DEBUG > 0){ // used to tell how long it takes to process the data
-      Serial.print("_____________________________cycle refresh = ");
-      Serial.print(refreshTime);
-      Serial.println("ms");
-      cycle = millis(); 
+  int refreshTime = millis() - cycle;
+  if (DEBUG == -1 ) { // used to tell how long it takes to process the data
+    Serial.print("_____________________________cycle refresh = ");
+    Serial.print(refreshTime);
+    Serial.println("ms");
+    cycle = millis();
+  }
+
+  //turn off LED
+  int ledTimeON = millis() - cycleLED;
+  if (ledTimeON > refreshTime && ledTimeON < 1000) {
+    digitalWrite(LED_BUILTIN, LOW); //turn off bulliten light
+  }
+
+  //check the sensors
+  for (int i = 0 ; i < NUMSWINGS; i++) { //now Cycle through and collect the values from each sensor
+      sensorLog[i][0] = digitalRead(swingSetPins[i][0]); //read both sensors at the same time
+      sensorLog[i][1] = digitalRead(swingSetPins[i][1]);
+      for (int k = 0; k < NUMSENSORS; k++) {
+        if (sensorLog[i][k] == LOW) tempSum[i]++;
       }
+    delay(7); // delay 10 ms to let the other swith depress on each swing
+  }
 
-      //turn off LED
-      int ledTimeON = cycleLED - millis();
-      if(ledTimeON > refreshTime && ledTimeON < 1000){
-        digitalWrite(LED_BUILTIN, LOW); //turn off bulliten light
-      }
+  //delay(cycleRefresh); //simply slows down the reads if necessary
 
-      //check the sensors readsPerCycle times ex: 500ms/33ms = 15.15 or 15
-      for(int x=0; x<READSPERCYCLE; x++){
-        for(int i = 0 ; i<NUMSENSORS; i++){ //now Cycle through and collect the values from each sensor
-        sensorLog[i][x] = sonar[i].ping_cm();
-        if(sensorLog[i][x] >= min_dist) tempSum[i]++;
-       }
-        delay(echo); 
-      }
+  //determine when and what midi signals to send
+  for (int i = 0 ; i < NUMSWINGS; i++) {
 
-      if(DEBUG > 3){ ///distances being read by the Sensors for one cycle in centimeters 
-          for(int i = 0 ; i<NUMSENSORS; i++){
-            Serial.print("sensor["); Serial.print(i); Serial.print("] = { ");  
-            for(int x=0; x<READSPERCYCLE; x++){
-              Serial.print(sensorLog[i][x]); 
-              if(x<READSPERCYCLE - 1) Serial.print(" , ");
-            }
-            Serial.println(" }"); 
-          }
-      }
+    if ((tempSum[i] > 0) && !triggeredSwings[i] && lastON[i] < 0) { //new Event on sensor "i"; send midi signal to turn on
+      triggeredSwings[i] = 1; //log the swing as on
+      digitalWrite(LED_BUILTIN, HIGH); //tell the board we have a triggered sensor
+      cycleLED = millis(); //log the time the LED was turned on
+      lastON[i] = millis(); //log the time we are turning on the swing
 
-
-
-      for(int i = 0 ; i<NUMSENSORS; i++){
-        if(DEBUG > 2){ ///number of triggered distances met by each sensor in the last cycle
-          Serial.print("tempSum["); Serial.print(i); Serial.print("] = "); Serial.println(tempSum[i]);
-          }
-        if((tempSum[i]>=hitTriggerON) && !triggeredSensors[i]){ //new Event on sensor "i"; send midi signal to turn on
-          triggeredSensors[i] = 1; //log the sensor as on
-          digitalWrite(LED_BUILTIN, HIGH); //tell the board we have a triggered sensor
-          cycleLED = millis(); //log the time the LED was turned on
-              if(DEBUG > 1){
-                  Serial.print(" turning ON sensor # ");
-                  Serial.println(i);
-                  }
-          ///Send midi data note on
-          if(MIDI_DataType == MIDI_note){ // 53 is F, 55 is G, 57 is A, 59 is B 
-            noteOn(channel, 53 + 2 * i , 127);
-            
-            if(DEBUG > 1){
-                Serial.print(" Playing Note :: ");
-                int note = 53 + 2 * i;
-                switch(note){
-                  case 53:
-                  Serial.println("F");
-                  break;
-                  case 55:
-                  Serial.println("G");
-                  break;
-                  case 57:
-                  Serial.println("A");
-                  break;
-                  case 59:
-                  Serial.println("B");
-                  break;       
-                }
-              } 
-          } else if (MIDI_DataType == MIDI_cc){
-            controlChange(5, cc1 + i , 127);
-              if(DEBUG > 1){
-                Serial.print(" MIDI_data :: CC ");
-                Serial.print(cc1 + i);
-                Serial.println(" :: value 127 ");
-              }
-          }
-          
-        } else if ((tempSum[i]<= hitTriggerOFF) && triggeredSensors[i]){ //new off signal
-          triggeredSensors[i] = 0; //log the sensor as off
-          digitalWrite(LED_BUILTIN, HIGH); //tell the board we have a triggered sensor
-          cycleLED = millis(); //log the time the LED was turned on
-              if(DEBUG > 1){
-                Serial.print(" turning OFF sensor # ");
-                Serial.println(i);
-              }
-          ///Send midi data note off
-          if(MIDI_DataType == MIDI_note){ // 53 is F, 55 is G, 57 is A, 59 is B 
-            noteOn(channel, 53 + 2 * i , 127); 
-              if(DEBUG > 1){
-                Serial.print(" Ending Note :: ");
-                int note = 53 + 2 * i;
-                switch(note){
-                  case 53:
-                  Serial.println("F");
-                  break;
-                  case 55:
-                  Serial.println("G");
-                  break;
-                  case 57:
-                  Serial.println("A");
-                  break;
-                  case 59:
-                  Serial.println("B");
-                  break;       
-                }
-              }
-          } else if (MIDI_DataType == MIDI_cc){
-            controlChange(5, cc1 + i , 0);
-              if(DEBUG > 1){
-                Serial.print(" MIDI_data :: CC ");
-                Serial.print(cc1 + i);
-                Serial.println(" :: value 0 ");
-              }
-          }
+      if(DEBUG == 0){/// PRODUCTION CODE: midi signals being sent to server
+        if(MIDI_DataType == MIDI_cc){
+          controlChange(channel, ccControl + i, ccON);
+        } 
+        else if(MIDI_DataType == MIDI_note){
+          //Note Swing 0 (53 = F), Swing 1 (55 = G), Swing 2 (57 = A), Swing 3 (59 = B)
+          int note = 53 + 2 * i; //log which note should be sent
+          noteOn(channel, note, 127);
+          //noteOff(channel, note, 127); //only needed if ableton needs an off signal
         }
-        tempSum[i] = 0; //clear for the next cycle
       }
+      else if (DEBUG >= 1) { /// Raw sensors data being read, and midi signals being sent in Serial Monitor
+        if(MIDI_DataType == MIDI_cc){
+            Serial.print("Swing "); Serial.print(i+1); Serial.print(" :: Sensors(");
+            Serial.print(sensorLog[i][0]); Serial.print(" , ");
+            Serial.print(sensorLog[i][1]);
+            Serial.print(" ) :: Turning ON (value = 100) :: control# ");
+            Serial.println(ccControl + i);
+        } 
+        else if(MIDI_DataType == MIDI_note){
+            Serial.print("Swing "); Serial.print(i+1); Serial.print(" :: Sensors(");
+            Serial.print(sensorLog[i][0]); Serial.print(" , ");
+            Serial.print(sensorLog[i][1]);
+            Serial.print(" ) :: Turning ON :: with note ");
+            
+            int note = 53 + 2 * i; //log which note should be sent
+              switch (note) {
+                case 53:
+                  Serial.println("F");
+                  break;
+                case 55:
+                  Serial.println("G");
+                  break;
+                case 57:
+                  Serial.println("A");
+                  break;
+                case 59:
+                  Serial.println("B");
+                  break;
+              }
+        }
+      }
+    } else if ((tempSum[i] == 0) && triggeredSwings[i] && ((millis() - lastON[i]) > minOFFdelay)) { //new off signal
+      
+      //change all the control values in the data structure
+      triggeredSwings[i] = 0; //log the sensor as off
+      lastON[i] = -1;
+      digitalWrite(LED_BUILTIN, HIGH); //tell the board we have a triggered sensor
+      cycleLED = millis(); //log the time the LED was turned on
+
+      if(DEBUG == 0){/// PRODUCTION CODE: midi signals being sent to server
+        if(MIDI_DataType == MIDI_cc){
+          controlChange(channel, ccControl + i, ccOFF);
+        } 
+        else if(MIDI_DataType == MIDI_note){
+          //Note Swing 0 (53 = F), Swing 1 (55 = G), Swing 2 (57 = A), Swing 3 (59 = B)
+          int note = 53 + 2 * i; //log which note should be sent
+          noteOn(channel, note, 127);
+          //noteOff(channel, note, 127); //only needed if ableton needs an off signal
+        }
+      }
+      else if (DEBUG >= 1) { /// Raw sensors data being read, and midi signals being sent in Serial Monitor
+        if(MIDI_DataType == MIDI_cc){
+            Serial.print("Swing "); Serial.print(i+1); Serial.print(" :: Sensors(");
+            Serial.print(sensorLog[i][0]); Serial.print(" , ");
+            Serial.print(sensorLog[i][1]);
+            Serial.print(" ) :: Turning OFF (value = 10) :: control# ");
+            Serial.println(ccControl + i);
+        } 
+        else if(MIDI_DataType == MIDI_note){
+            Serial.print("Swing "); Serial.print(i+1); Serial.print(" :: Sensors(");
+            Serial.print(sensorLog[i][0]); Serial.print(" , ");
+            Serial.print(sensorLog[i][1]);
+            Serial.print(" ) :: Turning OFF :: with note ");
+            
+            int note = 53 + 2 * i; //log which note should be sent
+              switch (note) {
+                case 53:
+                  Serial.println("F");
+                  break;
+                case 55:
+                  Serial.println("G");
+                  break;
+                case 57:
+                  Serial.println("A");
+                  break;
+                case 59:
+                  Serial.println("B");
+                  break;
+              }
+        }
+      }
+    } 
+
+      tempSum[i] = 0; //clear for the next cycle
+
+  }
 
 }
