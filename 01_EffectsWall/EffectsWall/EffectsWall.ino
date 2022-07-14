@@ -1,15 +1,27 @@
-// Midi CC controller Leonardo or Pro Micro
-// 5 button inputs, toggle or momentary
-// connect button pin to GROUND for ON. When button is off, pin is pulled high by internal pullup resistor.
-// (In Arduino IDE, set Board: to Leonardo, even if it's a Pro Micro)
-// by woz.lol
+//Effects Wall Production code
+// Directions for use:
+//    1) Flash with board type: Arduino Leonardo
+//    2) Connect back to the server (ethernet USB extender) - verify all connections are secure
+//    3) make sure playground piece to test is the only one plugged in
+//    4) open MIDI viewer, select "arduino leonardo", test the playground piece
+//    5) Expected behavior: When you spin a nob the MIDI viewer will display the changing MIDI data
+//                          When you push the buttons you should see sharp notes, or CC data
+//    
+   
 
-
-#define channel 5   //  midi channel -1 (starts at 0 = channel 1)
-#define cc1 30       // first midi CC number + Analog: CC 0-7 
-#define cc2 20       // first midi CC number + Buttons: CC 0-4
+// MIDI SETTINGS:
+#define channel 1         // Can be anywhere from 0-15 reported to user as 1-16: These need to be unique
+#define ccPot 50          // need to avoid 32 (used for lots of things internally in Ableton 
+                          // control number (0-119). for safety dont overlap with any other playground piece
+#define ccBtn 60          // need to avoid 32 (used for lots of things internally in Ableton 
+                          // control number (0-119). for safety dont overlap with any other playground piece
+#define ccON 100          // CC value above 64 is on signal to ableton
+#define ccOFF 10          // CC value below 63 is off signal to ableton
 
 #include <MIDIUSB.h>
+const int MIDI_cc = 1; 
+const int MIDI_note = 2; 
+int MIDI_DataType;
 
 // default button action is Momentary, to change a button to Toggle, change it's 1 to a 0 in it's position below:
 bool m[4] = {0, 0, 0, 0}; // MOMENTARY MODE for each button
@@ -17,15 +29,9 @@ bool m[4] = {0, 0, 0, 0}; // MOMENTARY MODE for each button
 
 const int DEBUG = 0;
 
- 
-#define buttonPinsDef 2, 3, 5, 7 // Pins: 2 3 5 7 10
 int btnNotes[4] = {49, 51, 54, 56}; //midi notes to send: { 49 = C#, 51 = D#, F#, G#, A# }
 int btnTiming[4] ={0 ,0 ,0 ,0 };
-byte buttonPin[4] = {buttonPinsDef};
-
-const int MIDI_cc = 1; 
-const int MIDI_note = 2; 
-int MIDI_DataType;
+byte buttonPin[4] = {2, 3, 5, 7};  //pinout for the buttons
 
 int cycle = 0; //used to keep track of time during the loop used to control the light
 
@@ -58,8 +64,8 @@ int cycle = 0; //used to keep track of time during the loop used to control the 
 
 
 
-bool buttonState[4] = {1, 1, 1, 1}; //1 = high = off
-bool buttonLast[4] = {1, 1, 1, 1};  //1 = high = off
+bool buttonState[4] = {0, 0, 0, 0}; //0 = low = off
+bool buttonLast[4] = {0, 0, 0, 0};  //0 = low = off
 
 void controlChange(byte thechannel, byte control, byte value) {
   midiEventPacket_t event = {0x0B, 0xB0 | thechannel, control, value};
@@ -75,62 +81,58 @@ void noteOn(byte thechannel, byte pitch, byte velocity) {
 void setup() {
   
   Serial.begin(115200);
-  //while (!Serial) {
-    // some boards need to wait to ensure access to serial over USB
-  //}
+  
   
   for (byte b = 0; b < 4; b++) {
     pinMode(buttonPin[b], INPUT_PULLUP);
   }
   
+    //set the midi data type for the buttons
+  MIDI_DataType = MIDI_cc; //options: MIDI_note or MIDI_cc
 
-    //set the midi data type
-  MIDI_DataType = MIDI_note; //options: MIDI_note or MIDI_cc
 
-
+}
+void loop() {
+  checkButtons();
+  checkAnalog();
 }
 
 void checkButtons() {
   for (byte b = 0; b < 4; b++) {
-    bool buttonNow = !digitalRead(buttonPin[b]);  // Low = On
+    bool buttonNow = !digitalRead(buttonPin[b]);  // High = On
  
     if (buttonNow != buttonState[b]) {  // check for new press
       buttonState[b] = buttonNow;
 
             
       if(buttonState[b] && (millis() - btnTiming[b]) > 150){
-      noteOn(channel, btnNotes[b] , 127 );
-      if(DEBUG >0) Serial.println(b); 
-      btnTiming[b] = millis();
-      } 
-      
-      /*
-      if (m[b]) {
-        controlChange(channel, cc2 + b, buttonNow * 127);
-          delay(100); //debounce button
-      } else {
-        if (buttonNow) {
-          if (buttonLast[b]) {
-            buttonLast[b] = 0;
-          } else {
-            buttonLast[b] = 1;
-          }
-          controlChange(channel, cc2 + b, buttonLast[b] * 127);
-          delay(100); //debounce button
-        }
+      if(MIDI_DataType == MIDI_cc){
+         controlChange(channel, ccBtn + b, ccON);
+      }else if (MIDI_DataType == MIDI_note){
+         noteOn(channel, btnNotes[b] , 127 );
       }
-      */
+      if(DEBUG >0) {
+        Serial.print("button ");
+        Serial.print(b); 
+        Serial.println("  turning on");
+      }
+      btnTiming[b] = millis();
+      } else if(!buttonState[b] && (millis() - btnTiming[b]) > 150){
+        
+        if(MIDI_DataType == MIDI_cc){
+         controlChange(channel, ccBtn + b, ccOFF);
+        }else if (MIDI_DataType == MIDI_note){
+         noteOn(channel, btnNotes[b] , 127 );
+        }
+      if(DEBUG > 0) {
+        Serial.print("button ");
+        Serial.print(b); 
+        Serial.println("  turning off");
+      }
+      btnTiming[b] = millis();
+      }
     }
   }
-}
-
-
-void loop() {
-
-  checkButtons();
-
-  checkAnalog();
-
 }
 
 
@@ -166,7 +168,18 @@ void checkAnalog() {
         // Record the new analogue value
         analogueInputs[i] = tempAnalogueInput;
         ///// send the midi message
-        controlChange(channel, cc1 + i, tempAnalogueInput);
+        controlChange(channel, ccPot + i, tempAnalogueInput);
+
+        if(DEBUG>0){
+          Serial.print("Effect ");
+          Serial.print(i);
+          Serial.print(" on channel ");
+          Serial.print(channel);
+          Serial.print(" with control ");
+          Serial.print(ccPot + i); 
+          Serial.print(" and value = "); 
+          Serial.println(tempAnalogueInput);
+        }
 
       }
     }

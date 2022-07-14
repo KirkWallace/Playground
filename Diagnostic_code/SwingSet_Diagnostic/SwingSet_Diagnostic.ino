@@ -22,7 +22,7 @@ int MIDI_DataType;
 //--DEBUG = -1 :: Timing info
 //--DEBUG = 0  :: Production state NEED TO BE 0 FOR FINAL INSTALL
 //--DEBUG >= 1  :: Swing logic, what swing is triggered and the note being sent
-const int DEBUG = 1;
+const int DEBUG = 2;
 
 //CONTROL LOGIC SETTINGS: Timing Variables and data structure
 long cycle = 0; //used to determine how many milliseconds since the last ping cycle
@@ -102,7 +102,7 @@ void loop() {
 
   //turn off LED
   int ledTimeON = millis() - cycleLED;
-  if (ledTimeON > refreshTime && ledTimeON < 1000) {
+  if (ledTimeON > 1*SEC) {
     digitalWrite(LED_BUILTIN, LOW); //turn off bulliten light
   }
 

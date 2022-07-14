@@ -1,295 +1,281 @@
-// Radio Frequency Merry Go Round TRANSMITTER, 4ch //
-// Board: Pro Micro pinout
-// Flash board as: Arduino LEONARDO
-// This board reads proximity sensors and sends that data via Radio Frequency (aka: wifi protocol)
-// to the interpreter board. the interpreter board will take this data and convert it to midi signals for ableton
+//Merry Go Round Production code
+// Directions for use:
+//    1) Flash with board type: Arduino Leonardo
+//    2) Connect back to the server (ethernet USB extender) - verify all connections are secure
+//    3) make sure playground piece to test is the only one plugged in
+//    4) open MIDI viewer, select arduino leonardo, test the playground piece
+//    5) Expected behavior: When you spin the Merry-Go round, MIDI viewer will display the MIDI data
+//                          if midi type is CC, then the channel(5), control number (90) and value (10 = OFF, 100 = ON) should be displayed
+//                          if midi type is note, then the channel(5) and note (48 = C) will be displayed
+//    NOTE: switches need to be wired with the COM1 terminal to GND (black) and NO3 terminal to signal wire (yellow or blue)
 
+// MIDI SETTINGS:
+#define channel 4         // Can be anywhere from 0-15 reported to user as 1-16: These need to be unique
+#define ccControl 90      // need to avoid 32 (used for lots of things internally in Ableton 
+// control number (0-119). for safety dont overlap with any other playground piece
+#define ccON 100          // CC value above 64 is on signal to ableton
+#define ccOFF 10          // CC value below 63 is off signal to ableton
 
-//// ---DEBUG settings:
-//-3: only cyclesOn debug statements
-//-2: only Transmission success and number on the merry go round
-//-1: logic flow - only when things are really broken
-//0: prints nothing during the loop
-//1: prints the cycle refresh timing and radio transmisions
-//2: prints the sensors that are triggered only when they are triggered.
-//3: prints each sensors triggered status every cycle
-//4: prints the actual distances being read by the sensors every cycle
+#include <MIDIUSB.h>
+const int MIDI_cc = 1;
+const int MIDI_note = 2;
+int MIDI_DataType;
+int note = 48; //48 is middle C
 
+/////----DEBUG SETTINGS:
+//--DEBUG = -2 :: Logic flow
+//--DEBUG = -1 :: Timing info
+//--DEBUG = 0  :: Production state NEED TO BE 0 FOR FINAL INSTALL
+//--DEBUG >= 2 :: Logic control for switching merry go round on and off. also what note is being sent
+//--DEBUG >= 3 :: RAW data for the switches. Only prints when a new switch is hit so it doesn't overload the serial print
 const int DEBUG = 0;
 
-
-// SETTINGS:
-#define min_dist 10     //minimum distance for the sensor to trigger
-//(30cm = 1' :: 61cm = 2' :: 122cm = 4' :: 190cm ~ 6')
-//NB: change max_dist back to 220cm before distributing
-#define max_dist 90   // maximum distance (in cm) to check
-#define echo 29     // delay time in ms between sensor reads (29 min to avoid ping overlap)
-
-
-#include <NewPing.h>
-#include <SPI.h> //required for wifi
-#include <nRF24L01.h> //required for wifi
-#include <RF24.h> //required for wifi
-
-//Timing and Logic Variables setup
-const int NUMSENSORS = 4;
-const int READSPERCYCLE = 10; //roughly the number of times you can read each sensor within 500ms given an echo of 33ms
-const int hitTriggerON = 6;
-const int hitTriggerOFF = 0;
+// CONTROL LOGIC SETTINGS: Timing Variables and data structure
+unsigned long cycle = 0; //used to determine how many milliseconds since the last cycle
+unsigned long cycleLED = 0; //used to keep track of how long the LED has been on and turn it off within a second
+const int NUMSENSORS = 8; // 2 sensors per spring
+const int READSPERCYCLE = 10; //can be used for debouncing the switches if needed
+int sensorLog[NUMSENSORS];  //raw data within each cycle
+int merryGo_data[NUMSENSORS]; //an array containing true or false data: first value new trigger, second value valid data
+int merryGo_data_lastCycle[NUMSENSORS]; //an array containing true or false data: first value new trigger, second value valid data
+int merryGo_continuousPress[NUMSENSORS];
+unsigned long merryGo_timing[NUMSENSORS]; //the actual time each sensor was last hit.
+int triggeredSensors[NUMSENSORS]; //used to bridge the cycles
+int tempSum = 0; //sums all sensors into one read out
+int lastTempSum = 0;
+int tempSumThresh = 0; //used to "delete" continuous btn readings
 const int SEC = 1000; //define 1 second as 1000 ms
-long cycle = 0; //used to determine how many milliseconds since the last ping cycle
-int cycleLED = 0; //used to keep track of how long the LED has been on and turn it off within a second
-int sensorLog[NUMSENSORS][READSPERCYCLE];  //Stores distances of initial sensor readings
-int cyclesOn[NUMSENSORS]; //Keep sensor on for at least 4 cycles
-int cycleThresh = 4; 
-int triggeredSensors[NUMSENSORS];          //keeps track of which sensors are on beyond each cycle
-int tempSum[NUMSENSORS];                   //stores number of sensor readings that met our trigger settings
-int numOnMerryGo = 0;   //as it says. mainly used in determining the final midi data send since we only send midi data when the number of people is 0 or greater than 0.
+const int minOFFdelay = 4 * SEC; //used to hold the merry go round on if it is used for less than 3 seconds.
+const int keepGoingDelay = 1.5 * SEC; //used for when we want to keep it going
+const int btnHoldTresh = 50; //the threshold that we consider the btn to be continually pressed, and thus turn it off.
+unsigned int sensorInfoPrint = 0;
+//TIMING EX: if the merry go round is only spun for 1 sec, then hold the music on for minOFFdelay
+//           if the merry go round is spun for >minOFFdelay, then hold music on until after a sensor hasn't been hit within keepGoingDelay time
+const int cycleRefreshDelay = 10; // 200ms delays to reads
+unsigned long lastON; //time of the last ON signal sent. used to make sure the trigger is on for longer than minOFFdelay
+unsigned long lastSWITCH; //time of the last switch hit. used to hold the melody on for the keepGoingDelay duration
+int lastSensorPin; //keeps track of the last sensor that was hit.
 bool playingMelody = false; //keeping track of what the Arduino thinks is going on with the music
-bool txSuccess = true; //needed to be true for the first time through the logic to work
 
-
-//wifi modules setup
-#define pin_CE 9  //definition things
-#define pin_CSN 8  //definition things
-#define numSpots 4 //spots on the merry go round
-int merryGo_data[numSpots] = {0, 0, 0, 0}; //an array containing true or false data: first value new trigger, second value valid data
-RF24 radio(pin_CE, pin_CSN); //initialize the radio object
-const byte address[6] = "00001";  //address through which two modules communicate.
-
-//sensor setup
-NewPing sonar[4] = {   // Sensor object array
-  NewPing(2, 3, max_dist), // Each sensor's (trigger pin, echo pin, and max distance to ping)
-  NewPing(4, 5, max_dist),
-  NewPing(18, 19, max_dist),
-  NewPing(20, 21, max_dist)
+int sensorPins[NUMSENSORS] = //pin numbers for each sensor
+{ 2, 3,   //Spring 1
+  4, 5,   //Spring 2
+  18, 19, //Spring 3
+  20, 21  //Spring 4
 };
 
-void printSettings() { //only use this in debug mode
-  Serial.println("--Booting up Merry Go Round TRANSMITTER--");
-  Serial.println("--Settings are as follows:");
-  Serial.print("    --Min Distance: ");
-  Serial.print(min_dist);
-  Serial.print(" cm    --Max Distance: ");
-  Serial.print(max_dist);
-  Serial.println(" cm");
-  Serial.println("--Settings are as follows:");  
-  Serial.print("Channel: ");
-  Serial.println(radio.getChannel());
-  Serial.print("Data Rate: ");
-  Serial.print(radio.getDataRate());
-  Serial.println("   ::  0 = min, 1 = low, 2 = high, 3 = max");
+
+// MIDI methods:
+void controlChange(byte thechannel, byte control, byte value) {
+  midiEventPacket_t event = {0x0B, 0xB0 | thechannel, control, value};
+  MidiUSB.sendMIDI(event);
+  MidiUSB.flush();
 }
 
-////-------------BEGIN THE ACTUAL SETUP PROCESS----------------////
+void noteOn(byte thechannel, byte pitch, byte velocity) {
+  midiEventPacket_t noteOn = {0x09, 0x90 | thechannel, pitch, velocity};
+  MidiUSB.sendMIDI(noteOn);
+}
+
+void noteOff(byte thechannel, byte pitch, byte velocity) {
+  midiEventPacket_t noteOff = {0x08, 0x80 | thechannel, pitch, velocity};
+  MidiUSB.sendMIDI(noteOff);
+}
+
+//   ARDUINO SETUP: initialize all variables to their default state and setup serial monitor.
+//              -setup pinout for the board.
+//              -switches need to be wired with the COM1 terminal to GND (black) and NO3 terminal to signal wire (yellow or blue)
 void setup() {
 
-  Serial.begin(115200); //115200 baud required for midi and RF24 signals
+  Serial.begin(115200); //115200 for production code
+
   cycle = millis();
 
-  for (int i = 0; i < numSpots; i++) { //clear the data storage
-    merryGo_data[i] = 0;
-        cyclesOn[i]= -1; //turn the cycle count off for every sensor 
- 
+  //set the midi data type
+  MIDI_DataType = MIDI_cc; //options: MIDI_note or MIDI_cc
+
+  tempSum = 0;
+  lastON = 0; //lastON < 0 is off.
+  lastSWITCH = 0; //lastSWITCH < 0 is off.
+
+  //initialize data structure and pinModes
+  for (int k = 0; k < NUMSENSORS; k++) {
+    sensorLog[k] = 0;
+    triggeredSensors[k] = 0;
+    merryGo_data[k]  = 0;
+    merryGo_data_lastCycle[k] = 0;
+    merryGo_continuousPress[k] = 0;
+    pinMode(sensorPins[k], INPUT_PULLUP);
   }
 
-  //-----setup the radio
-  radio.begin();
-  radio.setChannel(120); //127 wifi channels available. channels lower than 102 may conflict with commercial 2.4gHz wifi routers
-  radio.setDataRate(RF24_250KBPS);
-  /// Set power level: RF24_PA_MIN=-18dBm, RF24_PA_LOW=-12dBm, RF24_PA_HIGH=-6dBM, and RF24_PA_MAX=0dBm.
-  //radio.setPALevel(RF24_PA_MIN);
-  //radio.setPALevel(RF24_PA_LOW);
-  //radio.setPALevel(RF24_PA_HIGH);
-  radio.setPALevel(RF24_PA_MAX);
+  //onboard LED to notify locally of triggers
+  pinMode(LED_BUILTIN, OUTPUT);
 
-  radio.openWritingPipe(address);//set the address
-
-  radio.stopListening();//Set module as transmitter
-
-  pinMode(LED_BUILTIN, OUTPUT); //onboard LED to notify locally of triggers
-  //NB: attempting to notify for triggers, not really working at the moment
-
-  if (DEBUG > 0) printSettings();
 }
 
-
-////-------------THE MAIN PROCESS THAT RUNS CONTINUOUSLY----------------////
+//CONTROL LOGIC:
 void loop() {
 
-  if(DEBUG>0){ //restart serial Data upon Serial open if in debug mode 
-    //NB: NOT TESTED LOGIC
-    Serial.begin(115200);
-    while(!Serial){}
-  }
+  ////-----Setup for each cycle.
+  unsigned long refreshTime = millis() - cycle;
+  cycle = millis();
 
-  //------Cycle Resets
-  int refreshTime = millis() - cycle;
-  if (DEBUG > 0) { // used to tell how long it takes to process the data
-    Serial.print("_____________________________cycle refresh = ");
+  if (DEBUG < 0 ) {
+    Serial.print("____________cycle refresh = ");
     Serial.print(refreshTime);
     Serial.println("ms");
-    cycle = millis();
   }
 
-  //turn off LED
-  int ledTimeON = cycleLED - millis();
-  if ( ledTimeON > 1000) {//ledTimeON > refreshTime && ledTimeON < 1000
+  //turn off buliten LED if it has been a full second
+  unsigned long ledTimeON = millis() - cycleLED;
+  if (ledTimeON > 1 * SEC) { //make sure LED stays on for 1 sec
     digitalWrite(LED_BUILTIN, LOW); //turn off bulliten light
   }
 
 
-  //------Read Sensors
-  //--only read sensors if the transmission is successful, otherwise suspend sensor reading until the message is sent
-  if (txSuccess) { //if the last transmission was successful read the sensors
-    //otherwise move on and try to resend the data we already collected.
+  if (DEBUG == -2) {
+    Serial.println("___reading Sensors___");
+  }
+  ///-------Read the sensors
+  for (int i = 0 ; i < NUMSENSORS; i++) { //now Cycle through and collect the values from each sensor
+    merryGo_data[i] = !digitalRead(sensorPins[i]); //read both sensors at the same time
 
-    //read the sensors readsPerCycle times (ex: 500ms/33ms = 15.15 or 15)
-    //and then store the values
-    for (int x = 0; x < READSPERCYCLE; x++) {
-      for (int i = 0 ; i < NUMSENSORS; i++) { //now Cycle through and collect the values from each sensor
-        sensorLog[i][x] = sonar[i].ping_cm(); //store the distances read
-        if (sensorLog[i][x] >= min_dist) tempSum[i]++; //keep track of which distances are triggers
+    //preprocess timing for each btn. Make sure the btn isnt continually pressed and then record the time it was pressed
+    if (merryGo_data[i] && !merryGo_data_lastCycle[i]) { //new btn press
+      lastSWITCH = millis();
+      merryGo_timing[i] = millis();
+      if (DEBUG >= 2) {
+        Serial.print("Btn pressed :: time = ");
+        Serial.println(lastSWITCH);
       }
-      delay(echo);
+    } else if (merryGo_data[i] && merryGo_data_lastCycle[i]) { //btn pressed last cycle and this cycle too
+      merryGo_continuousPress[i] = 1;
     }
-    if (DEBUG == -1) Serial.println("made it past sensor readings");
+  }
 
-    if (DEBUG > 3) { ///DEBUG SECTION: distances being read by the Sensors for one cycle in centimeters
-      for (int i = 0 ; i < NUMSENSORS; i++) {
-        Serial.print("sensor["); Serial.print(i); Serial.print("] = { ");
-        for (int x = 0; x < READSPERCYCLE; x++) {
-          Serial.print(sensorLog[i][x]);
-          if (x < READSPERCYCLE - 1) Serial.print(" , ");
-        }
-        Serial.println(" }");
-      }
+
+
+  if (DEBUG == -2) {
+    Serial.println("___consolidate Data___");
+  }
+  //take the btn timing and consolidate to get the last switch trigger
+  for (int k = 0; k < NUMSENSORS; k++) {
+    //lastSWITCH = max(lastSWITCH , merryGo_timing[k]);
+    tempSum += merryGo_data[k];
+    tempSumThresh += merryGo_continuousPress[k];
+  }
+
+
+  if (DEBUG == -2) {
+    Serial.println("___MIDI logic___");
+  } else if (DEBUG >= 3 && tempSum > tempSumThresh ) {
+    Serial.print("Sensors 0=OFF 1=ON : (");
+    for (int x = 0; x < NUMSENSORS; x++) {
+      Serial.print(merryGo_data[x]);
+      if (x < NUMSENSORS - 1) Serial.print(" , ");
+      else Serial.println(" )");
     }
+    sensorInfoPrint = millis();
+    delay(cycleRefreshDelay); //simply slows down the reads if necessary
+  }
 
-    //------Once sensors read figure out how many are triggered
-    ///Now average the number of triggers met by each sensor to determine if the sensor should be 'triggered'
-    ///this is needed because the sensors are a little noisy and don't always read that someone is there
-    ///so we make ten readings and if the sensor reports a distance within the trigger more than hitTriggersON
-    ///we consider the sensor triggered. when that number falls below hitTriggerOFF we consider the sensor not 'triggered'
-    for (int i = 0 ; i < NUMSENSORS; i++) {
-      if (DEBUG > 2) { ///number of triggered distances met by each sensor in the last cycle
-        Serial.print("tempSum["); Serial.print(i); Serial.print("] = "); Serial.println(tempSum[i]);
-      }
-      if ((tempSum[i] >= hitTriggerON) && !triggeredSensors[i] && cyclesOn[i]<0) { //new Event on sensor "i"; send midi signal to turn on
-        triggeredSensors[i] = 1; //log the sensor as on
-        cyclesOn[i]=0;
-        digitalWrite(LED_BUILTIN, HIGH); //tell the board we have a triggered sensor
-        cycleLED = millis(); //log the time the LED was turned on
-        if (DEBUG > 1) {
-          Serial.print(" someone got on ");
-          Serial.println(i);
+
+  /////-------main logic for MIDI signals being sent
+  if (!playingMelody) { //handle ON signals
+    if (tempSum > tempSumThresh && lastTempSum == tempSumThresh) { //must have a new trigger
+      playingMelody = true;
+      lastON = millis();
+      if (DEBUG == 0) { //production code
+        if (MIDI_DataType == MIDI_cc) {
+          controlChange(channel, ccControl, ccON);
+
+          digitalWrite(LED_BUILTIN, HIGH); //turn on buliten light
+          cycleLED = millis();
         }
-        numOnMerryGo += 1;
+        else if (MIDI_DataType == MIDI_note) {
+          noteOn(channel, note, 127);
+          //noteOff(channel, note, 127); //only needed if ableton needs an off signal
 
-      } else if ((tempSum[i] <= hitTriggerOFF) && triggeredSensors[i]&& cyclesOn[i]>cycleThresh) { //new off signal
-        triggeredSensors[i] = 0; //log the sensor as off
-        digitalWrite(LED_BUILTIN, HIGH); //tell the board we have a triggered sensor
-        cycleLED = millis(); //log the time the LED was turned on
-        if (DEBUG > 1) {
-          Serial.print(" someone got off ");
-          Serial.println(i);
+          digitalWrite(LED_BUILTIN, HIGH); //turn on buliten light
+          cycleLED = millis();
         }
-        numOnMerryGo += -1;
-
-        //reset the cyclesOn
-        cyclesOn[i]= -1; //negative denotes an off sensor with no cycles triggered.
-      } else if(cyclesOn[i]>=0){
-          cyclesOn[i]++;
-        }
-
-      
-      tempSum[i] = 0; //clear for the next cycle
-    }
-          if(DEBUG == -3 ){ ///distances being read by the Sensors for one cycle in centimeters 
-          for(int i = 0 ; i<NUMSENSORS; i++){
-            Serial.print("Cycles On for sensor["); Serial.print(i); Serial.print("] = { ");  
-            Serial.print(cyclesOn[i]);
-            Serial.println(" }"); 
+      } else if (DEBUG >= 2) {
+         if (MIDI_DataType == MIDI_cc) {
+            Serial.print("Merry Go Round triggered :: Turning ON (ccValue = 100) :: control# ");
+            Serial.print(ccControl);
+            Serial.print(" :: on channel# ");
+            Serial.println(channel);
           }
+          else if (MIDI_DataType == MIDI_note) {
+            Serial.print("Merry Go Round Triggered :: Turning ON :: playing ");
+            switch (note) {
+              case 48: Serial.print("C"); break;
+              case 53: Serial.print("F"); break;
+              case 55: Serial.print("G"); break;
+              case 57: Serial.print("A"); break;
+              case 59: Serial.print("B"); break;
+            }
+            Serial.print(" value ");
+            Serial.print(note);
+            Serial.print(" :: on channel# ");
+            Serial.println(channel);
+            }
       }
-
-    
-    if (DEBUG == -1) Serial.println("made it passed summing");
-  } else {
-    if (DEBUG > 0) Serial.println("Tx failed...resending");
-    txSuccess = radio.write(&merryGo_data, sizeof(merryGo_data));
-  }
-
-  //------Take the Data of triggered data and figure out if we need to send an RF signal for midi data
-  //now with that data we need to figure out if the merry go round needs to send a signal.
-  //we only send a signal when we go from 'no sensors triggered' -> 'some sensors triggered' orrrr
-  //'some sensors triggered' -> 'no sensors triggered' ::: aka we don't care when we go from 1 to 3
-  //people on the merry go round or 4 to 1. only when everyone gets off or someone steps on
-  
-   if (numOnMerryGo > 0 && !playingMelody && txSuccess) { 
-    //START playing Melody
-    //the case when we go from numOnMerryGo=0 to numOnMerryGo>0 and music needs to play and the last transmision was successful
-    if (DEBUG > 0) {
-      Serial.print("Trigger sent: # of people on Merry Go = ");
-      Serial.println(numOnMerryGo);
     }
-    playingMelody = true;
-    ///store data to Send via rf to turn the track on
-    merryGo_data[0] = 1;
-    txSuccess = radio.write(&merryGo_data, sizeof(merryGo_data));
+  } else { //handle OFF signals
+    if (tempSum == tempSumThresh && millis() - lastON > minOFFdelay && millis() - lastSWITCH > keepGoingDelay) { //send off signal because we are on longer than minOffdelay
+      playingMelody = false;
 
-    if (txSuccess) {
-      //radio.flush_tx(); //clear the transmission buffer
-      merryGo_data[0] = 0; //tells the controller no changes need to be made to the playing state
-      //radio.write(&merryGo_data, sizeof(merryGo_data)); //send the null state, but dont record the transmission state
+      if (DEBUG == 0) {
+        if (MIDI_DataType == MIDI_cc) {
+          controlChange(channel, ccControl, ccOFF);
+
+          digitalWrite(LED_BUILTIN, HIGH); //turn on buliten light
+          cycleLED = millis();
+        }
+        else if (MIDI_DataType == MIDI_note) {
+          noteOn(channel, note, 127);
+          //noteOff(channel, note, 127); //only needed if ableton needs an off signal
+
+          digitalWrite(LED_BUILTIN, HIGH); //turn on buliten light
+          cycleLED = millis();
+        }
+      } else if (DEBUG >= 2) {
+         if (MIDI_DataType == MIDI_cc) {
+            Serial.print("Merry Go Round Triggered :: Turning OFF (ccValue = 10) :: control# ");
+            Serial.print(ccControl);
+            Serial.print(" :: on channel# ");
+            Serial.println(channel);
+          }
+          else if (MIDI_DataType == MIDI_note) {
+            Serial.print("Merry Go Round Triggered :: Turning OFF :: playing ");
+            switch (note) {
+              case 48: Serial.print("C"); break;
+              case 53: Serial.print("F"); break;
+              case 55: Serial.print("G"); break;
+              case 57: Serial.print("A"); break;
+              case 59: Serial.print("B"); break;
+            }
+            Serial.print(" value ");
+            Serial.print(note);
+            Serial.print(" :: on channel# ");
+            Serial.println(channel);
+            }
+      }
     }
 
   }
-  else if (numOnMerryGo == 0 && playingMelody && txSuccess) {
-    //STOP playing Melody
-    //the case when we go from numOnMerryGo>0 to numOnMerryGo=0 and music needs to stop playing and the last transmision was successful
-    if (DEBUG > 0) {
-      Serial.print("Trigger sent: # of people on Merry Go = ");
-      Serial.println(numOnMerryGo);
-    }
-    playingMelody = false;
-    ///store data to Send via rf to turn the track on
-    ///(yes it is the same as the 'turn on' signal: this is simply a toggle in ableton and requires the same signal)
-    merryGo_data[0] = 1;
-    txSuccess = radio.write(&merryGo_data, sizeof(merryGo_data));
 
-    if (txSuccess) {
-      //radio.flush_tx(); //clear the transmission buffer
-      merryGo_data[0] = 0; //tells the controller no changes need to be made to the playing state
-      //radio.write(&merryGo_data, sizeof(merryGo_data)); //send the null state, but dont record the transmission state
-    }
+
+  ///----CYCLE RESETS
+  lastTempSum = tempSum;
+  tempSum = 0;
+  tempSumThresh = 0;
+  for (int k = 0; k < NUMSENSORS; k++) {
+    sensorLog[k] = 0;
+    triggeredSensors[k] = 0;
+    merryGo_data_lastCycle[k] = merryGo_data[k]; //record the last cycle for the next cycle.
+    merryGo_continuousPress[k] = 0;
   }
-  else if ( numOnMerryGo < 0 || numOnMerryGo > 4) {  //ERROR: numOnMerryGo falls outside of 4 sensors...shouldn't happen, but this handles the issue gracefully
-    // RESET: the variable keeping track of the triggers because of a logic error
-    if (DEBUG > 0) Serial.println("------ERROR TOO MANY PEOPLE ON MERRY GO ROUND----------- Resetting.....");
-    numOnMerryGo = 0; //resets the variable in case it wanders outside the acceptable range
-  }
-  else if ( !txSuccess) { //resend the previous data 
-    //RESEND the data because we lost contact with the receiver
-    if (DEBUG == -2) Serial.println("---Resending TX---");
-    txSuccess = radio.write(&merryGo_data, sizeof(merryGo_data));
-  }
-  else {
-    //merryGo_data[0] = 0; //tells the controller no changes need to be made to the playing state
-  }
-
-
-  if (DEBUG == -2) { //transmission info and the number of "people" triggered sensors
-    Serial.print("Transmission Success = ");
-    Serial.print(txSuccess);
-    Serial.print("   ::   Number of triggered sensors = ");
-    Serial.println(numOnMerryGo);
-  }
-
-
-  //SUBMIT THE DATA to the controller - moved radio call into logic to keep track of tx send success
-
-  //radio.flush_tx(); //not sure we really need to do this, but its possible to clear the tx cache
-
-  if (DEBUG == -1) Serial.println("made it passed radio transmit");
+  delay(cycleRefreshDelay);
 }

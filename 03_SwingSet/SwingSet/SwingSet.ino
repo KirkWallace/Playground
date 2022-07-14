@@ -5,8 +5,8 @@
 //    3) make sure playground piece to test is the only one plugged in
 //    4) open MIDI viewer, select arduino leonardo, test the playground piece
 //    5) Expected behavior: When you sit on a swing the MIDI viewer will display the MIDI data
-//                          if midi type is CC, then the channel(3), control number (80-83) and value (10 = OFF, 100 = ON) should be displayed
-//                          if midi type is note, then the channel(3) and note, Swing 0 (53 = F), Swing 1 (55 = G), Swing 2 (57 = A), Swing 3 (59 = B) will be displayed
+//                          if midi type is CC, then the channel(4), control number (80-83) and value (10 = OFF, 100 = ON) should be displayed
+//                          if midi type is note, then the channel(4) and note, Swing 0 (53 = F), Swing 1 (55 = G), Swing 2 (57 = A), Swing 3 (59 = B) will be displayed
 //    NOTE: switches need to be wired with the COM1 terminal to GND (black) and NO3 terminal to signal wire (yellow or blue)
 
 // MIDI SETTINGS:
@@ -105,7 +105,7 @@ void loop() {
 
   //turn off LED
   int ledTimeON = millis() - cycleLED;
-  if (ledTimeON > refreshTime && ledTimeON < 1000) {
+  if (ledTimeON > 1*SEC) {
     digitalWrite(LED_BUILTIN, LOW); //turn off bulliten light
   }
 
