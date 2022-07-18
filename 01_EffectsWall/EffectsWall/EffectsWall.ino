@@ -5,8 +5,10 @@
 //    3) make sure playground piece to test is the only one plugged in
 //    4) open MIDI viewer, select "arduino leonardo", test the playground piece
 //    5) Expected behavior: When you spin a nob the MIDI viewer will display the changing MIDI data
-//                          When you push the buttons you should see sharp notes, or CC data
-//    
+//                          When you push the "top" button you should see control 60 with value ccON  
+//                          When you push the "second from top" button you should see control 60 with ccOFF value
+//                          Next btn will mimic the merry go round on so: channel 5, control 90, value ccON
+//                          Bottom btn will mimic the merry go round on so: channel 5, control 90, value ccOFF
    
 
 // MIDI SETTINGS:
@@ -32,8 +34,12 @@ const int DEBUG = 0;
 int btnNotes[4] = {49, 51, 54, 56}; //midi notes to send: { 49 = C#, 51 = D#, F#, G#, A# }
 int btnTiming[4] ={0 ,0 ,0 ,0 };
 byte buttonPin[4] = {2, 3, 5, 7};  //pinout for the buttons
+char noteNames[5] = {'C','D','F','G','A'};
 
-int cycle = 0; //used to keep track of time during the loop used to control the light
+//CONTROL LOGIC SETTINGS: Timing Variables and data structure
+unsigned long cycle = 0; //used to determine how many milliseconds since the last ping cycle
+unsigned long cycleLED = 0; //used to keep track of how long the LED has been on and turn it off within a second
+const int SEC = 1000; //define 1 second as 1000 ms
 
   #define ANALOGUE_PIN_ORDER A0, A1, A2, A3, A6, A7, A8, A9 // Pins: A0 A1 A2 A3 4 6 8 9  (see pro micro pinout)
   #define NUM_AI 8  // number of analog cc inputs
@@ -80,60 +86,117 @@ void noteOn(byte thechannel, byte pitch, byte velocity) {
 
 void setup() {
   
-  Serial.begin(115200);
+  Serial.begin(115200); 
+  
+  cycle = millis();
+
+  //set the midi data type
+  MIDI_DataType = MIDI_cc; //options: MIDI_note or MIDI_cc
   
   
-  for (byte b = 0; b < 4; b++) {
+  for (byte b = 0; b < 5; b++) {
     pinMode(buttonPin[b], INPUT_PULLUP);
   }
-  
-    //set the midi data type for the buttons
-  MIDI_DataType = MIDI_cc; //options: MIDI_note or MIDI_cc
 
-
+    //onboard LED to notify locally of triggers
+  pinMode(LED_BUILTIN, OUTPUT);
 }
+
 void loop() {
+  
+  int refreshTime = millis() - cycle;
+  if (DEBUG == -1 ) { // used to tell how long it takes to process the data
+    Serial.print("_____________________________cycle refresh = ");
+    Serial.print(refreshTime);
+    Serial.println("ms");
+    cycle = millis();
+  }
+
+  //turn off LED
+  int ledTimeON = millis() - cycleLED;
+  if (ledTimeON > 1*SEC) {
+    digitalWrite(LED_BUILTIN, LOW); //turn off builtin light
+  }
+  
   checkButtons();
   checkAnalog();
 }
 
-void checkButtons() {
-  for (byte b = 0; b < 4; b++) {
-    bool buttonNow = !digitalRead(buttonPin[b]);  // High = On
- 
-    if (buttonNow != buttonState[b]) {  // check for new press
-      buttonState[b] = buttonNow;
 
-            
+void checkButtons() {
+  
+  for (int b = 0; b < 4; b++) {
+    bool buttonNow = !digitalRead(buttonPin[b]);  // High = On
+    
+    if(buttonState[b] != buttonNow ){
+      
+      buttonState[b] = buttonNow;
+      
       if(buttonState[b] && (millis() - btnTiming[b]) > 150){
       if(MIDI_DataType == MIDI_cc){
-         controlChange(channel, ccBtn + b, ccON);
-      }else if (MIDI_DataType == MIDI_note){
-         noteOn(channel, btnNotes[b] , 127 );
+        int controlVal = 0;
+          switch(b){
+            case 0: 
+              controlVal = ccBtn + b;
+              controlChange(channel, controlVal, ccON);
+              break;
+            case 1: 
+              controlVal = ccBtn + b ;
+              controlChange(channel, controlVal, ccON);
+              break;
+            case 2: 
+              controlVal = ccBtn + b;
+              controlChange(4, 90, ccON);
+              break;
+            case 3: 
+              controlVal = ccBtn + b - 1;
+              controlChange(4, 90, ccOFF);
+              break;
+          }
+          if(DEBUG>0){
+            Serial.print("Button ");
+            Serial.print(b+1);
+            Serial.print(" hit :: Sending midi (Channel, Control, Value) = (");
+            Serial.print(channel);
+            Serial.print(" , ");
+            Serial.print(controlVal);
+            Serial.print(" , ");
+            if(b % 2 == 0){
+              Serial.print("ON"); 
+            }else {
+              Serial.print("OFF");
+            }
+            Serial.print(")  time::");
+            Serial.println(millis());
+          }
+      }else if(MIDI_DataType == MIDI_note){
+          noteOn(channel, btnNotes[b] , 127 );        
+          if(DEBUG>0){
+            Serial.print("Button ");
+            Serial.print(b+1);
+            Serial.print(" hit :: Sending midi (Channel, Note, Velocity) = (");
+            Serial.print(channel);
+            Serial.print(" , ");
+            Serial.print(noteNames[b]);
+            Serial.print("# , ");
+            Serial.print(127); 
+            Serial.print(")  time::");
+            Serial.println(millis());
+          }
       }
-      if(DEBUG >0) {
-        Serial.print("button ");
-        Serial.print(b); 
-        Serial.println("  turning on");
-      }
+      
+      digitalWrite(LED_BUILTIN, HIGH); //tell the board we have a triggered sensor
+      cycleLED = millis(); //log the time the LED was turned on
+
       btnTiming[b] = millis();
-      } else if(!buttonState[b] && (millis() - btnTiming[b]) > 150){
-        
-        if(MIDI_DataType == MIDI_cc){
-         controlChange(channel, ccBtn + b, ccOFF);
-        }else if (MIDI_DataType == MIDI_note){
-         noteOn(channel, btnNotes[b] , 127 );
-        }
-      if(DEBUG > 0) {
-        Serial.print("button ");
-        Serial.print(b); 
-        Serial.println("  turning off");
-      }
-      btnTiming[b] = millis();
-      }
+      } 
+    } else {
+      
+      
     }
   }
 }
+
 
 
 void checkAnalog() {
