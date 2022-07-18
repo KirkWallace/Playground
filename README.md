@@ -7,6 +7,7 @@ Since there are 4 major components you will see those in the major folders and t
 In the Diagnostic_code directory you will find diagnostic code for each playground piece. For troubleshooting flash the board with this code. You can then view (in the Serial monitor) what midi signal the arduino thinks it is sending to the server. 
 
 Steps to flash Arduino:
+	
 	1) Plug in arduino to be flashed (best to only have one arduino plugged in during this process)
 	2) Open Arduino IDE from the applications folder
 	3) Open the file you want to flash to the arduino (should match the playground piece you are looking to program)
