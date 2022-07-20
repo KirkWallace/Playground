@@ -38,7 +38,7 @@ const int DEBUG = 1;
 long cycle = 0; //used to determine how many milliseconds since the last ping cycle
 int cycleLED = 0; //used to keep track of how long the LED has been on and turn it off within a second
 const int SEC = 1000; //define 1 second as 1000 ms
-int debounce = 10; //10ms to debounce the button after it is triggered.
+int debounce = 0; //10ms to debounce the button after it is triggered.
 
 #define buttonPinsDef 2, 3, 5, 7, 9 // Pins: 2 3 5 7 10
 byte buttonPin[5] = {buttonPinsDef};
@@ -92,7 +92,7 @@ void checkButtons() {
       
       buttonState[b] = buttonNow;
       
-      if(buttonState[b] && (millis() - btnTiming[b]) > 150){
+      if(buttonState[b] && (millis() - btnTiming[b]) > 30){
       if(MIDI_DataType == MIDI_cc){
           controlChange(channel, ccBtn + b, ccON);
           if(DEBUG>0){
