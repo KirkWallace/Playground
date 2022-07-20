@@ -31,7 +31,7 @@ int MIDI_DataType;
 //--DEBUG = -1 :: Timing info
 //--DEBUG = 0  :: Production state NEED TO BE 0 FOR FINAL INSTALL
 //--DEBUG >= 1  :: btn logic, what touch pad is triggered and the cc/note being sent
-const int DEBUG = 1;
+const int DEBUG = 0;
 
 
 //CONTROL LOGIC SETTINGS: Timing Variables and data structure
